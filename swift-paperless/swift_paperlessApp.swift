@@ -18,7 +18,6 @@ struct MainView: View {
   @State private var showLoginScreen = false
 
   @State private var storeReady = false
-  @State private var showLoadingScreen = false
   @State private var store: DocumentStore?
   @State private var initialDisplay = true
   @State private var showSettings = false
@@ -129,7 +128,7 @@ struct MainView: View {
         } else {
           Logger.shared.debug("Changing active connection to \(targetConnection.id)")
           manager.activeConnectionId = targetConnection.id
-          await refreshConnection(animated: false)
+          await refreshConnection()
         }
       } else {
         if let server = route.server {
@@ -167,72 +166,57 @@ struct MainView: View {
     }
   }
 
-  private func refreshConnection(animated: Bool) async {
+  /// Point the store at the active connection and show it.
+  ///
+  /// Activation reads the server's stored versions and builds its repository
+  /// locally, so the documents appear from the cache straight away; the sync
+  /// runs behind them.
+  private func refreshConnection() async {
     Logger.api.info("Connection info changed, reloading!")
-    if let conn = manager.connection {
-      storeReady = false
-      if animated {
-        showLoadingScreen = true
-      }
-
-      func sleep(_ duration: Duration) async {
-        if animated {
-          try? await Task.sleep(for: duration)
-        }
-      }
-
-      Logger.api.info("Valid connection from connection manager: \(String(describing: conn))")
-      guard let stored = manager.storedConnection else {
-        Logger.api.error("Active connection has no stored connection record")
-        storeReady = false
-        showLoginScreen = true
-        showLoadingScreen = false
-        return
-      }
-
-      // The store activates onto the *same* session the SyncEngine sweeps this
-      // server with, so the active and inactive paths share one repository rather
-      // than racing two. A fresh store starts serverless (`NullRepository`) and is
-      // only published once `activate` succeeds — otherwise a failed login would
-      // leave a detached store installed.
-      let isNewStore = store == nil
-      let target = store ?? DocumentStore(registry: sessionRegistry)
-
-      if !isNewStore {
-        await sleep(.seconds(0.1))
-        target.events.emit(.repositoryWillChange)
-        await sleep(.seconds(0.3))
-      }
-
-      do {
-        try await target.activate(connection: stored)
-      } catch {
-        Logger.api.error("Could not build repository for active connection: \(error)")
-        storeReady = false
-        showLoginScreen = true
-        showLoadingScreen = false
-        return
-      }
-
-      if isNewStore {
-        store = target
-        observeFriendlyName(on: target)
-      }
-
-      storeReady = true
-      try? await target.sync()
-      target.startTaskPolling()
-      kickLibraryFill(target)
-      if !isNewStore {
-        await sleep(.seconds(0.3))
-      }
-      showLoadingScreen = false
-      showLoginScreen = false
-    } else {
+    guard let conn = manager.connection else {
       storeReady = false
       Logger.shared.trace("App does not have any active connection, show login screen")
       showLoginScreen = true
-      showLoadingScreen = false
+      return
+    }
+
+    Logger.api.info("Valid connection from connection manager: \(String(describing: conn))")
+    guard let stored = manager.storedConnection else {
+      Logger.api.error("Active connection has no stored connection record")
+      storeReady = false
+      showLoginScreen = true
+      return
+    }
+
+    // The store activates onto the *same* session the SyncEngine sweeps this
+    // server with, so the active and inactive paths share one repository rather
+    // than racing two. A fresh store starts serverless (`NullRepository`) and is
+    // only published once `activate` succeeds — otherwise a failed login would
+    // leave a detached store installed.
+    let isNewStore = store == nil
+    let target = store ?? DocumentStore(registry: sessionRegistry)
+
+    do {
+      try await target.activate(connection: stored)
+    } catch {
+      Logger.api.error("Could not build repository for active connection: \(error)")
+      storeReady = false
+      showLoginScreen = true
+      return
+    }
+
+    if isNewStore {
+      store = target
+      observeFriendlyName(on: target)
+    }
+
+    storeReady = true
+    showLoginScreen = false
+
+    Task {
+      try? await target.sync()
+      target.startTaskPolling()
+      kickLibraryFill(target)
     }
   }
 
@@ -275,9 +259,14 @@ struct MainView: View {
   var body: some View {
     VStack {
       ZStack {
-        if manager.connection != nil, storeReady {
+        if manager.connection != nil, storeReady, let store {
+          // A server switch remounts the document UI: navigation, selection
+          // and filters belong to the outgoing server. Keyed on the store's
+          // server, which changes only once the repository has been swapped.
           DocumentView(showSettings: $showSettings)
-            .environment(store!)
+            .id(store.activeServerID)
+            .transition(.opacity)
+            .environment(store)
             .environment(manager)
             .safeAreaInset(edge: .bottom, spacing: 0) {
               NeedsAuthBanner()
@@ -292,22 +281,16 @@ struct MainView: View {
                   .transition(.opacity)
               }
             }
+        } else {
+          // Until the first activation, which is local and near-instant once
+          // the server's versions are stored.
+          Color(uiColor: .systemBackground)
+            .ignoresSafeArea()
         }
-
-        VStack {
-          if showLoadingScreen {
-            MainLoadingView(
-              url: manager.connection?.url.absoluteString,
-              manager: manager
-            )
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .modifier(BackgroundColorModifier())
-          }
-        }
-        .animation(.default, value: showLoadingScreen)
       }
     }
     .animation(.default, value: storeReady)
+    .animation(.default, value: store?.activeServerID)
 
     .environmentObject(errorController)
     .environmentObject(biometricLockManager)
@@ -365,7 +348,7 @@ struct MainView: View {
       setupQuickActions()
 
       Logger.shared.notice("Checking login status")
-      await refreshConnection(animated: initialDisplay)
+      await refreshConnection()
       initialDisplay = false
 
       // Begin observing the server table for newly-added servers, and warm every
@@ -379,9 +362,9 @@ struct MainView: View {
 
     .onEvent(from: manager.events) { event in
       switch event {
-      case .connectionChange(let animated):
+      case .connectionChange:
         Task {
-          await refreshConnection(animated: animated)
+          await refreshConnection()
           // The just-deactivated server is now inactive: sweep it (and the rest).
           await syncEngine.syncInactiveServers()
         }
