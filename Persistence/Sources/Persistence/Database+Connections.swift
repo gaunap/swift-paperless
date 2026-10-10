@@ -88,6 +88,21 @@ extension Database {
     }
   }
 
+  /// Update only the `api_version` / `backend_version` columns on one row.
+  ///
+  /// No-op if the id doesn't match a row.
+  public func setServerVersions(
+    apiVersion: Int, backendVersion: String, forConnection id: UUID
+  ) throws(DatabaseError) {
+    try wrapping("setServerVersions") {
+      try writer.write { db in
+        try db.execute(
+          sql: "UPDATE server SET api_version = ?, backend_version = ? WHERE id = ?",
+          arguments: [apiVersion, backendVersion, id])
+      }
+    }
+  }
+
   /// An `AsyncSequence` of full connection-table snapshots, fired whenever
   /// the `server` table is written in this process. Backed by GRDB's
   /// `ValueObservation`; consumers don't see GRDB types.
