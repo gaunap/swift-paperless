@@ -14,6 +14,7 @@ import Common
 import Foundation
 import Networking
 import Persistence
+import os
 
 /// Build the caching repository stack for a stored connection.
 ///
@@ -34,8 +35,20 @@ public func makeCachingRepository(
   fileIndex: (any FileIndex)? = nil
 ) async throws -> CachingRepository<NeedsAuthRepository<ApiRepository>> {
   let connection = try stored.connection
+  let serverID = stored.id
   let api = await ApiRepository(
-    connection: connection, mode: mode, contentStore: contentStore, fileIndex: fileIndex)
+    connection: connection, mode: mode, contentStore: contentStore, fileIndex: fileIndex,
+    knownVersions: stored.knownVersions,
+    onVersionsChange: { versions in
+      do {
+        try database.setServerVersions(
+          apiVersion: Int(versions.apiVersion),
+          backendVersion: versions.backendVersion.description,
+          forConnection: serverID)
+      } catch {
+        Logger.api.error("Could not persist backend versions: \(error)")
+      }
+    })
   let needsAuth = NeedsAuthRepository(
     wrapping: api, serverID: stored.id, database: database)
   // Caching outermost: reads come from the GRDB cache, while sync's network
