@@ -81,13 +81,25 @@ public class ApiRepository {
     min(Self.maximumApiVersion, apiVersion ?? Self.minimumApiVersion)
   }
 
+  /// Called whenever a probe learns versions that differ from the current
+  /// ones, so the caller can persist them for the next
+  /// ``init(connection:mode:contentStore:fileIndex:knownVersions:onVersionsChange:)``.
+  private let onVersionsChange: (@MainActor (BackendVersions) -> Void)?
+
+  /// Both versions, once a probe (or the caller's `knownVersions`) has supplied them.
+  public var versions: BackendVersions? {
+    guard let apiVersion, let backendVersion else { return nil }
+    return BackendVersions(apiVersion: apiVersion, backendVersion: backendVersion)
+  }
+
   // Test seam: skips the backend-version discovery network call and accepts
   // a caller-provided URLSession (typically backed by `MockURLProtocol`).
   init(
     connection: Connection, mode: Mode, contentStore: ContentStore?,
     fileIndex: (any FileIndex)? = nil,
     urlSession: URLSession, apiVersion: UInt? = nil,
-    backendVersion: Version? = nil
+    backendVersion: Version? = nil,
+    onVersionsChange: (@MainActor (BackendVersions) -> Void)? = nil
   ) {
     self.connection = connection
     self.mode = mode
@@ -99,19 +111,25 @@ public class ApiRepository {
     self.urlSession = urlSession
     self.apiVersion = apiVersion
     self.backendVersion = backendVersion
+    self.onVersionsChange = onVersionsChange
   }
 
   /// - Parameters:
   ///   - contentStore: where downloaded files are kept, shared by every server.
   ///   - fileIndex: the index those files are recorded in. Both or neither:
   ///     a store without an index would hold files nothing can account for.
+  ///   - knownVersions: with these, the repository is usable immediately and
+  ///     re-probes in the background; without, it probes before returning.
   public init(
-    connection: Connection, mode: Mode, contentStore: ContentStore?, fileIndex: (any FileIndex)?
+    connection: Connection, mode: Mode, contentStore: ContentStore?, fileIndex: (any FileIndex)?,
+    knownVersions: BackendVersions? = nil,
+    onVersionsChange: (@MainActor (BackendVersions) -> Void)? = nil
   ) async {
     self.connection = connection
     self.mode = mode
     self.contentStore = contentStore
     self.fileIndex = fileIndex
+    self.onVersionsChange = onVersionsChange
     let sanitizedUrl = Self.sanitizeUrlForLog(connection.url)
     let tokenStr = sanitize(token: connection.token)
     Logger.networking.notice(
@@ -124,10 +142,21 @@ public class ApiRepository {
     thumbnailSessionDelegate = Self.makeThumbnailSessionDelegate(from: delegate)
     urlSession = URLSession(configuration: .default, delegate: delegate, delegateQueue: nil)
 
+    if let knownVersions {
+      // Serve from the last-known versions right away; the server's answer
+      // lands whenever it does, and a 406 in the meantime re-probes anyway.
+      apiVersion = knownVersions.apiVersion
+      backendVersion = knownVersions.backendVersion
+      Logger.networking.notice(
+        "Using known backend versions: API version: \(knownVersions.apiVersion), backend version: \(knownVersions.backendVersion)"
+      )
+      Task { _ = await self.reprobeVersion() }
+      return
+    }
+
     if let versions = await Self.loadBackendVersions(urlSession: urlSession, connection: connection)
     {
-      apiVersion = versions.apiVersion
-      backendVersion = versions.backendVersion
+      adopt(apiVersion: versions.apiVersion, backendVersion: versions.backendVersion)
     } else if let detected = await Self.iterateAcceptedApiVersion(
       urlSession: urlSession, connection: connection)
     {
@@ -342,12 +371,23 @@ public class ApiRepository {
     }
   }
 
-  // Re-runs API-version detection after the backend rejected a request with 406
+  /// Set the versions and report them through `onVersionsChange` if they differ.
+  private func adopt(apiVersion: UInt, backendVersion: Version?) {
+    let before = versions
+    self.apiVersion = apiVersion
+    self.backendVersion = backendVersion
+    if let after = versions, after != before {
+      onVersionsChange?(after)
+    }
+  }
+
+  // Re-runs API-version detection: in the background after starting from known
+  // versions, and after the backend rejected a request with 406
   // (`unsupportedVersion`) — typically because the version was locked in while
   // the backend was unreachable. Updates `apiVersion`/`backendVersion` in place
   // and returns the detected API version, or nil if detection failed (e.g. the
   // backend is still unreachable). Concurrent callers share one in-flight probe.
-  private func reprobeVersion() async -> UInt? {
+  func reprobeVersion() async -> UInt? {
     if let versionReprobeTask {
       return await versionReprobeTask.value
     }
@@ -356,8 +396,7 @@ public class ApiRepository {
       if let versions = await Self.loadBackendVersions(
         urlSession: urlSession, connection: connection)
       {
-        apiVersion = versions.apiVersion
-        backendVersion = versions.backendVersion
+        adopt(apiVersion: versions.apiVersion, backendVersion: versions.backendVersion)
         return versions.apiVersion
       }
       if let detected = await Self.iterateAcceptedApiVersion(
@@ -365,7 +404,7 @@ public class ApiRepository {
       {
         // The iteration probe can't learn the backend version string; keep any
         // previously-known value rather than clobbering feature support to nil.
-        apiVersion = detected
+        adopt(apiVersion: detected, backendVersion: backendVersion)
         return detected
       }
       return nil
@@ -1259,6 +1298,10 @@ extension ApiRepository: Repository {
     try await send(.post, endpoint: endpoint, body: ["tasks": ids])
   }
 
+  // An unseeded server waits on this probe before its first render, so it
+  // gives up well short of URLSession's 60 s default.
+  nonisolated private static let versionProbeTimeout: TimeInterval = 10
+
   private static func loadBackendVersions(urlSession: URLSession, connection: Connection) async -> (
     apiVersion: UInt, backendVersion: Version
   )? {
@@ -1271,7 +1314,7 @@ extension ApiRepository: Repository {
         return nil
       }
 
-      var request = URLRequest(url: url)
+      var request = URLRequest(url: url, timeoutInterval: versionProbeTimeout)
       request.cachePolicy = .reloadIgnoringLocalCacheData
       Self.addTokenTo(request: &request, token: connection.token)
       connection.extraHeaders.apply(toRequest: &request)
@@ -1339,7 +1382,7 @@ extension ApiRepository: Repository {
     for v in stride(
       from: Int(maximumApiVersion), through: Int(minimumApiVersion), by: -1)
     {
-      var request = URLRequest(url: url)
+      var request = URLRequest(url: url, timeoutInterval: versionProbeTimeout)
       request.cachePolicy = .reloadIgnoringLocalCacheData
       addTokenTo(request: &request, token: connection.token)
       connection.extraHeaders.apply(toRequest: &request)
